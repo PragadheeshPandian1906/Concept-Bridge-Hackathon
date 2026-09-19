@@ -1,0 +1,17 @@
+scenario,match_key,student_id,question_id,concept,score
+success,S1|S2,S1,FQ1,SQL Joins,0.80
+success,S1|S2,S1,FQ2,SQL Joins,0.70
+success,S1|S2,S2,FQ1,Recursion,0.85
+success,S1|S2,S2,FQ2,Recursion,0.75
+success,S1|S3,S1,FQ1,SQL Joins,0.80
+success,S1|S3,S1,FQ2,SQL Joins,0.70
+success,S1|S3,S3,FQ1,Recursion,0.85
+success,S1|S3,S3,FQ2,Recursion,0.75
+ineffective,S1|S2,S1,FQ1,SQL Joins,0.43
+ineffective,S1|S2,S1,FQ2,SQL Joins,0.33
+ineffective,S1|S2,S2,FQ1,Recursion,0.47
+ineffective,S1|S2,S2,FQ2,Recursion,0.37
+ineffective,S1|S3,S1,FQ1,SQL Joins,0.83
+ineffective,S1|S3,S1,FQ2,SQL Joins,0.73
+ineffective,S1|S3,S3,FQ1,Recursion,0.87
+ineffective,S1|S3,S3,FQ2,Recursion,0.77
