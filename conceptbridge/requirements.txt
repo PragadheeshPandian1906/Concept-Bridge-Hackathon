@@ -1,0 +1,10 @@
+# Both are OPTIONAL.
+#
+# pydantic : if absent, slice/compat.py provides a strict fallback BaseModel
+# pytest   : if absent, run `python tests/run_tests.py` instead
+#
+# The OpenRouter client uses only the standard library, so the agent has
+# no hard third-party dependency at all.
+
+pydantic>=2.0
+pytest>=7.0
