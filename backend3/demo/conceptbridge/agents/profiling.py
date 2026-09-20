@@ -10,10 +10,7 @@ class ConceptProfilingAgent:
     def __init__(self, store: Store, settings: Settings):
         self.store = store
         self.llm = OpenRouterClient(settings)
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/agents/profiling.py
-=======
         self.strict_llm = settings.strict_llm
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/agents/profiling.py
 
     def score_answer(self, student_id: str, question_id: str, answer: str) -> dict:
         question = self.store.one("SELECT * FROM questions WHERE id=?", (question_id,))
@@ -31,10 +28,7 @@ class ConceptProfilingAgent:
                 score = min(question["max_marks"], max(0.0, grade.score * question["max_marks"] / 5))
                 normalized = round(score / question["max_marks"], 4)
             except LLMUnavailable:
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/agents/profiling.py
-=======
                 if self.strict_llm: raise
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/agents/profiling.py
                 # Safe demo/offline fallback; MCQs never reach this branch.
                 score = min(question["max_marks"], question["max_marks"] * (0.8 if len(answer.strip()) >= 30 else 0.4))
                 normalized = round(score / question["max_marks"], 4)

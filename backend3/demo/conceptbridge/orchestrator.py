@@ -48,20 +48,13 @@ class Orchestrator:
     def approve(self,candidate_id:str,actor:str,duration:int)->dict:
         candidate=self.candidate(candidate_id); run=self.store.one("SELECT * FROM runs WHERE id=?",(candidate["run_id"],))
         if candidate["status"]!="PENDING" or run["current_state"]!="WAITING_FOR_HUMAN_REVIEW": raise ValueError("Candidate is not awaiting human review")
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/orchestrator.py
-=======
         # Fail closed before changing approval state when strict LLM generation is unavailable.
         plan = self.learning.generate_plan(candidate, duration)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/orchestrator.py
         now=utcnow()
         with self.store.connection() as conn:
             conn.execute("UPDATE candidates SET status='APPROVED' WHERE id=?",(candidate_id,)); conn.execute("INSERT INTO candidate_decisions(candidate_id,action,actor,reason,created_at) VALUES(?,?,?,?,?)",(candidate_id,"APPROVED",actor,None,now)); conn.execute("INSERT INTO match_history(candidate_id,participants_signature,outcome,created_at) VALUES(?,?,?,?)",(candidate_id,candidate["participant_signature"],"APPROVED",now))
         self.transition(candidate["run_id"],"SESSION","human approved candidate")
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/orchestrator.py
-        return {"candidate":self.candidate(candidate_id),"session":self.learning.create_session(candidate,duration),"run":self.run_view(candidate["run_id"])}
-=======
         return {"candidate":self.candidate(candidate_id),"session":self.learning.create_session(candidate,duration,plan),"run":self.run_view(candidate["run_id"])}
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/orchestrator.py
 
     def approve_all(self, run_id: str, actor: str, duration: int) -> dict:
         """Human batch decision: approve every still-pending candidate in this exact run."""
@@ -72,11 +65,8 @@ class Orchestrator:
         candidate_ids = [row["id"] for row in self.store.all("SELECT id FROM candidates WHERE run_id=? AND status='PENDING' ORDER BY score DESC,id", (run_id,))]
         if not candidate_ids: raise ValueError("Run has no pending candidates")
         candidates = [self.candidate(candidate_id) for candidate_id in candidate_ids]
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/orchestrator.py
-=======
         # Generate all plans before persisting the batch decision, preventing partial batches.
         plans = {candidate["id"]: self.learning.generate_plan(candidate, duration) for candidate in candidates}
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/orchestrator.py
         now = utcnow()
         with self.store.connection() as conn:
             for candidate in candidates:
@@ -84,11 +74,7 @@ class Orchestrator:
                 conn.execute("INSERT INTO candidate_decisions(candidate_id,action,actor,reason,created_at) VALUES(?,?,?,?,?)", (candidate["id"],"APPROVED",actor,"batch approval",now))
                 conn.execute("INSERT INTO match_history(candidate_id,participants_signature,outcome,created_at) VALUES(?,?,?,?)", (candidate["id"],candidate["participant_signature"],"APPROVED",now))
         self.transition(run_id,"SESSION","human approved all pending candidates")
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/orchestrator.py
-        sessions = [self.learning.create_session(candidate,duration) for candidate in candidates]
-=======
         sessions = [self.learning.create_session(candidate,duration,plans[candidate["id"]]) for candidate in candidates]
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/orchestrator.py
         return {"run":self.run_view(run_id),"approved_count":len(candidates),"candidate_ids":candidate_ids,"sessions":sessions}
 
     def reject(self,candidate_id:str,actor:str,reason:str|None)->dict:
@@ -106,18 +92,11 @@ class Orchestrator:
         run = self.store.one("SELECT current_state FROM runs WHERE id=?", (session["run_id"],))
         if session["status"] != "PLANNED": raise ValueError("Session is already completed")
         if run["current_state"] not in {"SESSION", "EVALUATION"}: raise ValueError("Session is not active")
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/orchestrator.py
-        self.learning.complete(session_id)
-        if run["current_state"] == "SESSION":
-            self.transition(session["run_id"], "EVALUATION", "peer-learning session completed")
-        return self.evaluation.create(session_id)
-=======
         generated = self.evaluation.generate_questions(session_id)
         self.learning.complete(session_id)
         if run["current_state"] == "SESSION":
             self.transition(session["run_id"], "EVALUATION", "peer-learning session completed")
         return self.evaluation.create(session_id, generated)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/orchestrator.py
 
     def complete_all_sessions(self, run_id: str) -> dict:
         """Complete every planned session in a human-approved batch and create its evaluation."""
@@ -127,9 +106,6 @@ class Orchestrator:
             raise ValueError("Run has no active sessions")
         session_ids = [row["id"] for row in self.store.all("SELECT id FROM sessions WHERE run_id=? AND status='PLANNED' ORDER BY created_at,id", (run_id,))]
         if not session_ids: raise ValueError("Run has no planned sessions to complete")
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/orchestrator.py
-        evaluations = [self.start_evaluation(session_id) for session_id in session_ids]
-=======
         # Do all LLM work first: either the whole batch is ready, or no session is completed.
         generated = {session_id: self.evaluation.generate_questions(session_id) for session_id in session_ids}
         evaluations = []
@@ -139,7 +115,6 @@ class Orchestrator:
             current = self.store.one("SELECT current_state FROM runs WHERE id=?", (run_id,))
             if current["current_state"] == "SESSION": self.transition(run_id, "EVALUATION", "peer-learning session completed")
             evaluations.append(self.evaluation.create(session_id, generated[session_id]))
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/orchestrator.py
         return {"run":self.run_view(run_id),"completed_session_count":len(session_ids),"evaluations":evaluations}
 
     def submit_evaluation(self,evaluation_id:str,post_scores:dict[str,float])->dict:

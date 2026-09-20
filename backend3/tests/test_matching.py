@@ -1,24 +1,14 @@
 from pathlib import Path
-<<<<<<< HEAD:conceptbridge/tests/test_matching.py
-
-from demo.conceptbridge.config import Settings
-from demo.conceptbridge.db import Store
-=======
 import pytest
 
 from demo.conceptbridge.config import Settings
 from demo.conceptbridge.db import Store
 from demo.conceptbridge.llm import LLMUnavailable
->>>>>>> ea01724 (working final backend):backend3/tests/test_matching.py
 from demo.conceptbridge.orchestrator import Orchestrator
 
 
 def make_system(tmp_path: Path):
-<<<<<<< HEAD:conceptbridge/tests/test_matching.py
-    settings=Settings(database_path=str(tmp_path/"test.db"),min_group_size=2,max_group_size=5,max_teaching_load=10)
-=======
     settings=Settings(database_path=str(tmp_path/"test.db"),min_group_size=2,max_group_size=5,max_teaching_load=10,strict_llm=False,demo_mode=True)
->>>>>>> ea01724 (working final backend):backend3/tests/test_matching.py
     store=Store(settings); store.initialize()
     with store.connection() as conn:
         conn.execute("INSERT INTO concepts(id,name,description) VALUES('r','Recursion','')")
@@ -62,8 +52,6 @@ def test_human_can_approve_all_candidates_in_a_run(tmp_path):
     assert completed["completed_session_count"] == result["candidate_count"]
     assert len(completed["evaluations"]) == result["candidate_count"]
     assert completed["run"]["current_state"] == "EVALUATION"
-<<<<<<< HEAD:conceptbridge/tests/test_matching.py
-=======
 
 
 def test_strict_llm_failure_does_not_approve_candidate(tmp_path):
@@ -74,4 +62,3 @@ def test_strict_llm_failure_does_not_approve_candidate(tmp_path):
     with pytest.raises(LLMUnavailable): system.approve(candidate_id,"reviewer",45)
     assert system.candidate(candidate_id)["status"] == "PENDING"
     assert system.run_view(result["id"])["current_state"] == "WAITING_FOR_HUMAN_REVIEW"
->>>>>>> ea01724 (working final backend):backend3/tests/test_matching.py

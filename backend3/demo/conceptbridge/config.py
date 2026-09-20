@@ -17,12 +17,8 @@ class Settings(BaseSettings):
     max_teaching_load: int = 3
     previous_match_penalty: float = 0.08
     ineffective_match_penalty: float = 0.15
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/config.py
-    demo_mode: bool = True
-=======
     demo_mode: bool = False
     strict_llm: bool = True
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/config.py
     openrouter_api_key: str | None = Field(default=None, validation_alias=AliasChoices("OPENROUTER_API_KEY", "CONCEPTBRIDGE_OPENROUTER_API_KEY"))
     llm_model: str = "openai/gpt-4.1-mini"
     llm_fallback_model: str = "openai/gpt-4.1-mini"

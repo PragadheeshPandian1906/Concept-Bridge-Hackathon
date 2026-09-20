@@ -7,20 +7,14 @@ from .config import get_settings
 from .db import Store, utcnow
 from .graph import KnowledgeGraph
 from .orchestrator import Orchestrator
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-=======
 from .llm import LLMUnavailable
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
 from .schemas import AnswerSubmit, ApproveRequest, ConceptCreate, EvaluationBatchSubmit, EvaluationSubmit, QuestionCreate, RejectRequest, ScoreUpsert, StudentCreate
 
 settings=get_settings(); store=Store(settings); profiling=ConceptProfilingAgent(store,settings); graph=KnowledgeGraph(store,settings); orchestrator=Orchestrator(store,settings)
 
 def _error(exc: Exception):
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-=======
     if isinstance(exc, LLMUnavailable):
         raise HTTPException(status_code=503,detail=f"LLM generation is required but unavailable: {exc}")
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
     raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 409,detail=str(exc))
 
 @asynccontextmanager
@@ -71,11 +65,7 @@ def create_question(payload:QuestionCreate):
 @app.post("/api/v1/questions/{question_id}/answers")
 def submit_answer(question_id:str,payload:AnswerSubmit):
     try: return profiling.score_answer(payload.student_id,question_id,payload.answer)
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-    except ValueError as exc: _error(exc)
-=======
     except (ValueError, LLMUnavailable) as exc: _error(exc)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
 
 @app.post("/api/v1/profiling/run")
 def run_profiling(): return {"profiles_updated":profiling.build_profiles()}
@@ -97,20 +87,12 @@ def get_candidate(candidate_id:str):
 @app.post("/api/v1/matching/{candidate_id}/approve")
 def approve(candidate_id:str,payload:ApproveRequest):
     try:return orchestrator.approve(candidate_id,payload.actor,payload.duration_minutes)
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-    except ValueError as exc:_error(exc)
-=======
     except (ValueError, LLMUnavailable) as exc:_error(exc)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
 
 @app.post("/api/v1/matching/runs/{run_id}/approve-all")
 def approve_all(run_id:str,payload:ApproveRequest):
     try:return orchestrator.approve_all(run_id,payload.actor,payload.duration_minutes)
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-    except ValueError as exc:_error(exc)
-=======
     except (ValueError, LLMUnavailable) as exc:_error(exc)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
 
 @app.post("/api/v1/matching/{candidate_id}/reject")
 def reject(candidate_id:str,payload:RejectRequest):
@@ -120,20 +102,12 @@ def reject(candidate_id:str,payload:RejectRequest):
 @app.post("/api/v1/sessions/{session_id}/complete")
 def complete_session(session_id:str):
     try:return orchestrator.start_evaluation(session_id)
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-    except ValueError as exc:_error(exc)
-=======
     except (ValueError, LLMUnavailable) as exc:_error(exc)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
 
 @app.post("/api/v1/matching/runs/{run_id}/sessions/complete-all")
 def complete_all_sessions(run_id:str):
     try:return orchestrator.complete_all_sessions(run_id)
-<<<<<<< HEAD:conceptbridge/demo/conceptbridge/api.py
-    except ValueError as exc:_error(exc)
-=======
     except (ValueError, LLMUnavailable) as exc:_error(exc)
->>>>>>> ea01724 (working final backend):backend3/demo/conceptbridge/api.py
 
 @app.post("/api/v1/evaluations/{evaluation_id}/submit")
 def submit_evaluation(evaluation_id:str,payload:EvaluationSubmit):
