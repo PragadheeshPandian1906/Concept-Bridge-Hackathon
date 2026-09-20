@@ -1,169 +1,79 @@
-"""MATCHING - deterministic reciprocal compatibility.
+from collections import Counter
+from itertools import combinations
+from uuid import uuid4
 
-This is the algorithmic heart of ConceptBridge, and it contains no model
-calls at all. An LLM may later *explain* a candidate; it can never
-compute, re-rank or alter one.
-
-Eligibility
------------
-A teaches B on concept c when::
-
-    A[c] >= STRENGTH_THRESHOLD  and  B[c] < GAP_THRESHOLD
-
-A pair is a candidate only if BOTH directions teach at least one concept
-(true reciprocity - two strong students are not a match, and a one-way
-tutor pairing is not a match).
-
-Score
------
-    a_to_b_score = sum(A[c] - B[c] for c in a_teaches)      # gap closed
-    b_to_a_score = sum(B[c] - A[c] for c in b_teaches)
-    total        = a_to_b_score + b_to_a_score
-    balance      = 1 - |a_to_b_score - b_to_a_score| / total    in [0, 1]
-
-    compatibility = clamp(total / IDEAL_TOTAL_GAP, 0, 1)
-                    * (0.5 + 0.5 * balance)
-
-``IDEAL_TOTAL_GAP`` (2.5) is roughly "four concepts of ~0.6 gap each":
-the point at which extra gap stops adding value. The balance factor
-rewards pairs that help each other equally, and is floored at 0.5 so a
-lopsided-but-real reciprocal pair still scores.
-"""
-
-from __future__ import annotations
-
-from .schema import MatchCandidate, MatchCandidates, StudentProfile
-
-STRENGTH_THRESHOLD = 0.70
-GAP_THRESHOLD = 0.60
-IDEAL_TOTAL_GAP = 2.5
-MIN_COMPATIBILITY = 0.05
+from .config import Settings
+from .db import Store, utcnow
+from .graph import KnowledgeGraph
 
 
-def match_id_for(student_a: str, student_b: str) -> str:
-    """Order-independent identity for a pair, e.g. ``S1|S2``."""
-    return "|".join(sorted([student_a, student_b]))
+class MatchmakingAgent:
+    """Purely deterministic, exhaustive combination matcher. Reciprocity/cycles only improve score."""
+    def __init__(self, store: Store, settings: Settings):
+        self.store, self.settings, self.graph = store, settings, KnowledgeGraph(store, settings)
 
+    @staticmethod
+    def signature(ids: tuple[str, ...] | list[str]) -> str: return "|".join(sorted(ids))
 
-def can_teach(teacher: StudentProfile, learner: StudentProfile, concept: str,
-              strength: float = STRENGTH_THRESHOLD,
-              gap: float = GAP_THRESHOLD) -> bool:
-    return teacher.score_for(concept) >= strength and learner.score_for(concept) < gap
+    def _history(self, signature: str) -> tuple[int, int, float]:
+        rows = self.store.all("SELECT outcome,details_json FROM match_history WHERE participants_signature=?", (signature,))
+        previous = len(rows); ineffective = sum(row["outcome"] == "INEFFECTIVE" for row in rows)
+        gains = []
+        for row in rows:
+            details = self.store.load(row["details_json"])
+            if "average_gain" in details: gains.append(details["average_gain"])
+        return previous, ineffective, sum(gains)/len(gains) if gains else 0.0
 
+    def _rejected_signatures(self, root_id: str) -> set[str]:
+        rows = self.store.all("SELECT c.participant_signature FROM candidates c JOIN runs r ON r.id=c.run_id WHERE r.root_id=? AND c.status='REJECTED'", (root_id,))
+        return {r["participant_signature"] for r in rows}
 
-def strengths(profile: StudentProfile, strength: float = STRENGTH_THRESHOLD) -> list[str]:
-    return [c.concept for c in profile.concepts if c.score >= strength]
+    def _candidate(self, members: tuple[str, ...], edges: list[dict], concept_count: int) -> dict | None:
+        internal = [e for e in edges if e["source_student"] in members and e["target_student"] in members]
+        # This is the only relationship-validity rule: a group must transfer at least one real concept.
+        if not internal: return None
+        outgoing = Counter(e["source_student"] for e in internal)
+        historic_load = {student: self.store.one("SELECT COUNT(*) count FROM learning_gains WHERE teacher_id=?", (student,))["count"] for student in members}
+        if any(historic_load[s] + outgoing[s] > self.settings.max_teaching_load for s in outgoing): return None
+        concepts = sorted({e["concept_id"] for e in internal})
+        coverage = len(concepts) / max(concept_count, 1)
+        pairs = {(e["source_student"],e["target_student"]) for e in internal}
+        reciprocal = sum(1 for a,b in pairs if a < b and (b,a) in pairs)
+        reciprocity = reciprocal / max(len(pairs), 1)
+        # Cycle is evidence only; a source fan-out remains a valid group.
+        cycle = any(a == e2["target_student"] and b == e2["source_student"] for a,b in pairs for e2 in internal)
+        transfer_strength = sum(e["transfer_gap"] for e in internal) / len(internal)
+        balance = 1 - (max(outgoing.values()) - min(outgoing.values())) / max(len(internal), 1)
+        fairness = max(0.0, min(1.0, balance))
+        signature = self.signature(members); previous, ineffective, observed_gain = self._history(signature)
+        observed_effectiveness = max(0.0, min(1.0, observed_gain))
+        penalty = previous*self.settings.previous_match_penalty + ineffective*self.settings.ineffective_match_penalty
+        raw = (self.settings.weight_coverage*coverage + self.settings.weight_reciprocity*reciprocity + self.settings.weight_transfer_strength*transfer_strength + self.settings.weight_fairness*fairness + self.settings.weight_effectiveness*observed_effectiveness - penalty)
+        relationships = [{"teacher_id":e["source_student"],"teacher_name":e["teacher_name"],"learner_id":e["target_student"],"learner_name":e["learner_name"],"concept_id":e["concept_id"],"concept":e["concept"],"teacher_score":round(e["teacher_score"],3),"learner_score":round(e["learner_score"],3),"transfer_gap":round(e["transfer_gap"],3)} for e in internal]
+        evidence = {"knowledge_coverage":round(coverage,4),"knowledge_coverage_percent":round(coverage*100,2),"reciprocity":round(reciprocity,4),"knowledge_cycle":cycle,"transfer_strength":round(transfer_strength,4),"fairness":round(fairness,4),"previous_match_penalty":round(previous*self.settings.previous_match_penalty,4),"ineffective_match_penalty":round(ineffective*self.settings.ineffective_match_penalty,4),"observed_effectiveness":round(observed_effectiveness,4),"teaching_load":dict(outgoing),"reasons":[f"{r['teacher_name']} is strong in {r['concept']} ({r['teacher_score']:.2f}) while {r['learner_name']} has a gap ({r['learner_score']:.2f}); transfer gap {r['transfer_gap']:.2f}." for r in relationships] + [f"The group covers {len(concepts)} relevant concept(s).", "Reciprocity and cycles affect ranking only; they are not validity requirements."]}
+        return {"participant_ids":list(members),"signature":signature,"relationships":relationships,"evidence":evidence,"score":round(max(0.0, raw),4)}
 
+    def generate(self, root_id: str, include_rejected: bool = False) -> tuple[list[dict], dict]:
+        students = [s["id"] for s in self.store.all("SELECT id FROM students ORDER BY id")]; edges = self.graph.active_edges()
+        concepts = self.store.all("SELECT id FROM concepts"); considered = {}
+        candidates = []
+        for size in range(self.settings.min_group_size, min(self.settings.max_group_size,len(students))+1):
+            considered[str(size)] = 0
+            for members in combinations(students,size):
+                considered[str(size)] += 1
+                candidate = self._candidate(members,edges,len(concepts))
+                if candidate: candidates.append(candidate)
+        rejected = self._rejected_signatures(root_id)
+        filtered = [c for c in candidates if include_rejected or c["signature"] not in rejected]
+        # Reintroduce candidates only when excluding rejections would leave the human no options.
+        final = filtered if filtered else candidates
+        final.sort(key=lambda c:(-c["score"],c["signature"]))
+        return final,{"combinations_considered":considered,"all_valid_before_rematch_filter":len(candidates),"rejected_excluded":len(candidates)-len(filtered)}
 
-def gaps(profile: StudentProfile, gap: float = GAP_THRESHOLD) -> list[str]:
-    return [c.concept for c in profile.concepts if c.score < gap]
-
-
-def teachable_concepts(teacher: StudentProfile, learner: StudentProfile,
-                       strength: float = STRENGTH_THRESHOLD,
-                       gap: float = GAP_THRESHOLD) -> list[str]:
-    """Concepts `teacher` can usefully teach `learner`, best gap first."""
-    useful = [
-        (teacher.score_for(c.concept) - learner.score_for(c.concept), c.concept)
-        for c in teacher.concepts
-        if can_teach(teacher, learner, c.concept, strength, gap)
-    ]
-    useful.sort(key=lambda item: (-item[0], item[1]))
-    return [concept for _, concept in useful]
-
-
-def primary_concept(teacher: StudentProfile, learner: StudentProfile,
-                    concepts: list[str]) -> str | None:
-    """The concept a session focuses on: the largest gap in that direction."""
-    if not concepts:
-        return None
-    return max(concepts,
-               key=lambda c: (teacher.score_for(c) - learner.score_for(c), c))
-
-
-def score_pair(a: StudentProfile, b: StudentProfile,
-               strength: float = STRENGTH_THRESHOLD,
-               gap: float = GAP_THRESHOLD) -> MatchCandidate | None:
-    """Return a scored candidate, or None when the pair is not reciprocal."""
-    a_teaches = teachable_concepts(a, b, strength, gap)
-    b_teaches = teachable_concepts(b, a, strength, gap)
-    if not a_teaches or not b_teaches:
-        return None
-
-    a_to_b = sum(a.score_for(c) - b.score_for(c) for c in a_teaches)
-    b_to_a = sum(b.score_for(c) - a.score_for(c) for c in b_teaches)
-    total = a_to_b + b_to_a
-    if total <= 0:
-        return None
-
-    balance = 1.0 - abs(a_to_b - b_to_a) / total
-    coverage = min(1.0, total / IDEAL_TOTAL_GAP)
-    compatibility = round(coverage * (0.5 + 0.5 * balance), 4)
-
-    rationale = (
-        f"{a.student_name} can teach {', '.join(a_teaches)}; "
-        f"{b.student_name} can teach {', '.join(b_teaches)}. "
-        f"Gap closed {a_to_b:.2f} one way and {b_to_a:.2f} the other "
-        f"(balance {balance:.2f})."
-    )
-    return MatchCandidate(
-        match_id=match_id_for(a.student_id, b.student_id),
-        student_a=a.student_id,
-        student_b=b.student_id,
-        compatibility_score=compatibility,
-        a_teaches=a_teaches,
-        b_teaches=b_teaches,
-        rationale=rationale,
-        a_to_b_score=round(a_to_b, 4),
-        b_to_a_score=round(b_to_a, 4),
-        balance=round(balance, 4),
-    )
-
-
-def generate_candidates(profiles: list[StudentProfile],
-                        excluded: list[str] | set[str] | None = None,
-                        strength: float = STRENGTH_THRESHOLD,
-                        gap: float = GAP_THRESHOLD) -> MatchCandidates:
-    """All eligible pairs, best first. Excluded match_ids are dropped."""
-    excluded = set(excluded or ())
-    by_id = sorted(profiles, key=lambda p: p.student_id)
-    items: list[MatchCandidate] = []
-
-    for i in range(len(by_id)):
-        for j in range(i + 1, len(by_id)):
-            a, b = by_id[i], by_id[j]
-            if match_id_for(a.student_id, b.student_id) in excluded:
-                continue
-            candidate = score_pair(a, b, strength, gap)
-            if candidate and candidate.compatibility_score >= MIN_COMPATIBILITY:
-                items.append(candidate)
-
-    # deterministic ordering: score desc, then match_id asc
-    items.sort(key=lambda c: (-c.compatibility_score, c.match_id))
-    return MatchCandidates(items=items)
-
-
-def best_candidate(profiles: list[StudentProfile],
-                   excluded: list[str] | set[str] | None = None) -> MatchCandidate | None:
-    candidates = generate_candidates(profiles, excluded)
-    return candidates.items[0] if candidates.items else None
-
-
-def fallback_explanation(candidate: MatchCandidate,
-                         a: StudentProfile, b: StudentProfile) -> str:
-    """Deterministic explanation used when the LLM is unavailable or fails."""
-    lines = [
-        f"{a.student_name} and {b.student_name} are a reciprocal match "
-        f"(compatibility {candidate.compatibility_score:.2f}).",
-    ]
-    for teacher, learner, concepts in (
-        (a, b, candidate.a_teaches), (b, a, candidate.b_teaches)
-    ):
-        for concept in concepts:
-            lines.append(
-                f"- {teacher.student_name} scored {teacher.score_for(concept):.2f} "
-                f"on {concept} where {learner.student_name} scored "
-                f"{learner.score_for(concept):.2f}."
-            )
-    lines.append("Each student therefore has something to teach and something to learn.")
-    return "\n".join(lines)
+    def persist_candidates(self, run_id: str, candidates: list[dict]) -> list[dict]:
+        now=utcnow()
+        with self.store.connection() as conn:
+            for candidate in candidates:
+                candidate["id"] = f"CAN-{uuid4().hex[:12]}"; candidate["run_id"] = run_id; candidate["status"]="PENDING"
+                conn.execute("INSERT INTO candidates(id,run_id,participant_ids_json,participant_signature,relationships_json,evidence_json,score,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (candidate["id"],run_id,self.store.dump(candidate["participant_ids"]),candidate["signature"],self.store.dump(candidate["relationships"]),self.store.dump(candidate["evidence"]),candidate["score"],"PENDING",now))
+        return candidates
