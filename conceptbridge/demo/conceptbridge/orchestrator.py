@@ -1,110 +1,158 @@
-"""The orchestrator is infrastructure, not an agent. It owns 'what happens next'."""
-from __future__ import annotations
+from uuid import uuid4
 
-from sqlalchemy.orm import Session as DBSession
-
-from slice.budget import Budget
-
-from . import artifacts
-from .evaluation import agent as evaluation_agent
-from .matchmaking import agent as matchmaking_agent
-from .matchmaking import graph as G
-from .peer_learning import agent as peer_agent
-from .persistence.models import MatchCandidate, Session
-from .profiling import agent as profiling_agent
-from .state import RunState, transition
+from .agents.learning import EvaluationAgent, PeerLearningAgent
+from .config import Settings
+from .db import Store, utcnow
+from .graph import KnowledgeGraph
+from .matching import MatchmakingAgent
 
 
-def run_profiling(db: DBSession, run_id: str, budget: Budget | None = None) -> dict:
-    result = profiling_agent.run_profiling(db, run_id, budget)
-    transition(db, run_id, RunState.PROFILING, "quiz answers scored")
-    artifacts.save(run_id, "profile_snapshot", result["profiles"])
-    transition(db, run_id, RunState.MATCHING, "profiles ready")
-    return result
+class Orchestrator:
+    def __init__(self, store: Store, settings: Settings):
+        self.store, self.settings = store, settings
+        self.graph = KnowledgeGraph(store, settings); self.matcher = MatchmakingAgent(store, settings)
+        self.learning = PeerLearningAgent(store, settings); self.evaluation = EvaluationAgent(store, settings)
 
+    def transition(self, run_id: str, state: str, reason: str) -> None:
+        run = self.store.one("SELECT current_state FROM runs WHERE id=?", (run_id,))
+        if not run: raise ValueError("Run not found")
+        allowed = {"INPUT":{"PROFILING","MATCHING"},"PROFILING":{"MATCHING"},"MATCHING":{"WAITING_FOR_HUMAN_REVIEW","NO_MATCH_FOUND"},"WAITING_FOR_HUMAN_REVIEW":{"SESSION","MATCHING"},"SESSION":{"EVALUATION"},"EVALUATION":{"UPDATED_PROFILE","MATCHING"},"UPDATED_PROFILE":{"FINISHED"},"NO_MATCH_FOUND":{"FINISHED"}}
+        if state not in allowed.get(run["current_state"],set()): raise ValueError(f"Invalid transition {run['current_state']} -> {state}")
+        now=utcnow()
+        with self.store.connection() as conn:
+            conn.execute("UPDATE runs SET previous_state=?,current_state=?,updated_at=? WHERE id=?", (run["current_state"],state,now,run_id))
+            conn.execute("INSERT INTO transitions(run_id,from_state,to_state,reason,created_at) VALUES(?,?,?,?,?)", (run_id,run["current_state"],state,reason,now))
 
-def run_matching(db: DBSession, run_id: str, student_ids: list[str] | None = None) -> dict:
-    G.build_graph(db)
-    artifacts.save(run_id, "graph_snapshot_before", G.snapshot(db))
-    match = matchmaking_agent.propose_match(db, run_id, student_ids)
-    if match is None:
-        transition(db, run_id, RunState.NO_MATCH_FOUND, "no eligible complementary group")
-        return {"state": RunState.NO_MATCH_FOUND.value, "match": None, "health": G.graph_health(db)}
-    transition(db, run_id, RunState.WAITING_FOR_APPROVAL, f"proposed {match.id}")
-    artifacts.save(run_id, "match", _match_dict(match))
-    return {"state": RunState.WAITING_FOR_APPROVAL.value, "match": _match_dict(match), "health": G.graph_health(db)}
+    def run_matching(self, trigger: str = "manual", parent_run_id: str | None = None) -> dict:
+        self.graph.rebuild()
+        parent = self.store.one("SELECT * FROM runs WHERE id=?",(parent_run_id,)) if parent_run_id else None
+        run_id=f"RUN-{uuid4().hex[:12]}"; root_id=parent["root_id"] if parent else run_id; iteration=(parent["iteration"]+1) if parent else 1; now=utcnow()
+        with self.store.connection() as conn:
+            conn.execute("INSERT INTO runs(id,root_id,parent_run_id,iteration,current_state,previous_state,trigger,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(run_id,root_id,parent_run_id,iteration,"INPUT",None,trigger,now,now))
+            conn.execute("INSERT INTO transitions(run_id,from_state,to_state,reason,created_at) VALUES(?,?,?,?,?)",(run_id,None,"INPUT","run created",now))
+        self.transition(run_id,"PROFILING","profiles available")
+        self.transition(run_id,"MATCHING",trigger)
+        candidates, stats=self.matcher.generate(root_id)
+        if not candidates:
+            self.transition(run_id,"NO_MATCH_FOUND","no valid group has an internal transfer edge")
+            return self.run_view(run_id)|{"candidate_count":0,"candidates":[],"generation":stats}
+        candidates=self.matcher.persist_candidates(run_id,candidates)
+        self.transition(run_id,"WAITING_FOR_HUMAN_REVIEW","all valid candidates generated")
+        return self.run_view(run_id)|{"candidate_count":len(candidates),"candidates":candidates,"generation":stats}
 
+    def candidate(self,candidate_id:str)->dict:
+        row=self.store.one("SELECT * FROM candidates WHERE id=?",(candidate_id,))
+        if not row: raise ValueError("Candidate not found")
+        return {**row,"participant_ids":self.store.load(row.pop("participant_ids_json")),"relationships":self.store.load(row.pop("relationships_json")),"evidence":self.store.load(row.pop("evidence_json"))}
 
-def approve_match(db: DBSession, match_id: str, decided_by: str = "instructor", reason: str = "") -> dict:
-    match = db.get(MatchCandidate, match_id)
-    match.status = "APPROVED"
-    match.decided_by = decided_by
-    match.reason = reason
-    db.commit()
-    transition(db, match.run_id, RunState.SESSION, f"{match_id} approved by {decided_by}")
-    return _match_dict(match)
+    def approve(self,candidate_id:str,actor:str,duration:int)->dict:
+        candidate=self.candidate(candidate_id); run=self.store.one("SELECT * FROM runs WHERE id=?",(candidate["run_id"],))
+        if candidate["status"]!="PENDING" or run["current_state"]!="WAITING_FOR_HUMAN_REVIEW": raise ValueError("Candidate is not awaiting human review")
+        now=utcnow()
+        with self.store.connection() as conn:
+            conn.execute("UPDATE candidates SET status='APPROVED' WHERE id=?",(candidate_id,)); conn.execute("INSERT INTO candidate_decisions(candidate_id,action,actor,reason,created_at) VALUES(?,?,?,?,?)",(candidate_id,"APPROVED",actor,None,now)); conn.execute("INSERT INTO match_history(candidate_id,participants_signature,outcome,created_at) VALUES(?,?,?,?)",(candidate_id,candidate["participant_signature"],"APPROVED",now))
+        self.transition(candidate["run_id"],"SESSION","human approved candidate")
+        return {"candidate":self.candidate(candidate_id),"session":self.learning.create_session(candidate,duration),"run":self.run_view(candidate["run_id"])}
 
+    def approve_all(self, run_id: str, actor: str, duration: int) -> dict:
+        """Human batch decision: approve every still-pending candidate in this exact run."""
+        run = self.store.one("SELECT * FROM runs WHERE id=?", (run_id,))
+        if not run: raise ValueError("Run not found")
+        if run["current_state"] != "WAITING_FOR_HUMAN_REVIEW":
+            raise ValueError("Run is not awaiting human review")
+        candidate_ids = [row["id"] for row in self.store.all("SELECT id FROM candidates WHERE run_id=? AND status='PENDING' ORDER BY score DESC,id", (run_id,))]
+        if not candidate_ids: raise ValueError("Run has no pending candidates")
+        candidates = [self.candidate(candidate_id) for candidate_id in candidate_ids]
+        now = utcnow()
+        with self.store.connection() as conn:
+            for candidate in candidates:
+                conn.execute("UPDATE candidates SET status='APPROVED' WHERE id=?", (candidate["id"],))
+                conn.execute("INSERT INTO candidate_decisions(candidate_id,action,actor,reason,created_at) VALUES(?,?,?,?,?)", (candidate["id"],"APPROVED",actor,"batch approval",now))
+                conn.execute("INSERT INTO match_history(candidate_id,participants_signature,outcome,created_at) VALUES(?,?,?,?)", (candidate["id"],candidate["participant_signature"],"APPROVED",now))
+        self.transition(run_id,"SESSION","human approved all pending candidates")
+        sessions = [self.learning.create_session(candidate,duration) for candidate in candidates]
+        return {"run":self.run_view(run_id),"approved_count":len(candidates),"candidate_ids":candidate_ids,"sessions":sessions}
 
-def reject_match(db: DBSession, match_id: str, decided_by: str = "instructor", reason: str = "") -> dict:
-    match = db.get(MatchCandidate, match_id)
-    match.status = "REJECTED"
-    match.decided_by = decided_by
-    match.reason = reason
-    db.commit()
-    transition(db, match.run_id, RunState.MATCHING, f"{match_id} rejected: {reason}")
-    return _match_dict(match)
+    def reject(self,candidate_id:str,actor:str,reason:str|None)->dict:
+        candidate=self.candidate(candidate_id); run=self.store.one("SELECT * FROM runs WHERE id=?",(candidate["run_id"],))
+        if candidate["status"]!="PENDING" or run["current_state"]!="WAITING_FOR_HUMAN_REVIEW": raise ValueError("Candidate is not awaiting human review")
+        now=utcnow()
+        with self.store.connection() as conn:
+            conn.execute("UPDATE candidates SET status='REJECTED' WHERE id=?",(candidate_id,)); conn.execute("INSERT INTO candidate_decisions(candidate_id,action,actor,reason,created_at) VALUES(?,?,?,?,?)",(candidate_id,"REJECTED",actor,reason,now)); conn.execute("INSERT INTO match_history(candidate_id,participants_signature,outcome,created_at,details_json) VALUES(?,?,?,?,?)",(candidate_id,candidate["participant_signature"],"REJECTED",now,self.store.dump({"reason":reason})))
+        self.transition(candidate["run_id"],"MATCHING","human rejected candidate")
+        return self.run_matching("human rejection",candidate["run_id"])
 
+    def start_evaluation(self, session_id: str) -> dict:
+        session = self.store.one("SELECT * FROM sessions WHERE id=?", (session_id,))
+        if not session: raise ValueError("Session not found")
+        run = self.store.one("SELECT current_state FROM runs WHERE id=?", (session["run_id"],))
+        if session["status"] != "PLANNED": raise ValueError("Session is already completed")
+        if run["current_state"] not in {"SESSION", "EVALUATION"}: raise ValueError("Session is not active")
+        self.learning.complete(session_id)
+        if run["current_state"] == "SESSION":
+            self.transition(session["run_id"], "EVALUATION", "peer-learning session completed")
+        return self.evaluation.create(session_id)
 
-def generate_session(db: DBSession, match_id: str, budget: Budget | None = None) -> Session:
-    session = peer_agent.generate_session(db, match_id, budget)
-    artifacts.save(session.run_id, "session_plan", session.plan)
-    return session
+    def complete_all_sessions(self, run_id: str) -> dict:
+        """Complete every planned session in a human-approved batch and create its evaluation."""
+        run = self.store.one("SELECT current_state FROM runs WHERE id=?", (run_id,))
+        if not run: raise ValueError("Run not found")
+        if run["current_state"] not in {"SESSION", "EVALUATION"}:
+            raise ValueError("Run has no active sessions")
+        session_ids = [row["id"] for row in self.store.all("SELECT id FROM sessions WHERE run_id=? AND status='PLANNED' ORDER BY created_at,id", (run_id,))]
+        if not session_ids: raise ValueError("Run has no planned sessions to complete")
+        evaluations = [self.start_evaluation(session_id) for session_id in session_ids]
+        return {"run":self.run_view(run_id),"completed_session_count":len(session_ids),"evaluations":evaluations}
 
+    def submit_evaluation(self,evaluation_id:str,post_scores:dict[str,float])->dict:
+        evaluation=self.store.one("SELECT * FROM evaluations WHERE id=?",(evaluation_id,));
+        if not evaluation or evaluation["status"]!="PENDING": raise ValueError("Evaluation is not pending")
+        session=self.store.one("SELECT * FROM sessions WHERE id=?",(evaluation["session_id"],)); candidate=self.candidate(session["candidate_id"])
+        run_id=session["run_id"]; relationships=candidate["relationships"]; gains=[]
+        for relationship in relationships:
+            concept_id=relationship["concept_id"]
+            if concept_id not in post_scores: continue
+            post=max(0.0,min(1.0,float(post_scores[concept_id]))); pre=relationship["learner_score"]; gain=round(post-pre,4); effective=gain>=self.settings.effective_gain_threshold
+            gains.append((relationship,pre,post,gain,effective))
+        if not gains: raise ValueError("Post scores must include at least one concept taught in the session")
+        effective=all(item[4] for item in gains); now=utcnow()
+        with self.store.connection() as conn:
+            for rel,pre,post,gain,is_effective in gains:
+                conn.execute("INSERT INTO learning_gains(evaluation_id,teacher_id,learner_id,concept_id,pre_score,post_score,gain,effective) VALUES(?,?,?,?,?,?,?,?)",(evaluation_id,rel["teacher_id"],rel["learner_id"],rel["concept_id"],pre,post,gain,int(is_effective)))
+                if is_effective: conn.execute("INSERT INTO concept_scores(student_id,concept_id,score,source,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(student_id,concept_id) DO UPDATE SET score=excluded.score,source=excluded.source,updated_at=excluded.updated_at",(rel["learner_id"],rel["concept_id"],post,"evaluation",now))
+            result={"effective":effective,"gains":[{"teacher_id":r["teacher_id"],"learner_id":r["learner_id"],"concept_id":r["concept_id"],"pre_score":p,"post_score":po,"gain":g,"effective":e} for r,p,po,g,e in gains]}
+            conn.execute("UPDATE evaluations SET status='SUBMITTED',result_json=?,submitted_at=? WHERE id=?",(self.store.dump(result),now,evaluation_id)); conn.execute("INSERT INTO match_history(candidate_id,participants_signature,outcome,created_at,details_json) VALUES(?,?,?,?,?)",(candidate["id"],candidate["participant_signature"],"EFFECTIVE" if effective else "INEFFECTIVE",now,self.store.dump({"average_gain":sum(x[3] for x in gains)/len(gains)})))
+        pending_sessions = self.store.all("SELECT s.id FROM sessions s LEFT JOIN evaluations e ON e.session_id=s.id WHERE s.run_id=? AND (e.status IS NULL OR e.status!='SUBMITTED')", (run_id,))
+        if pending_sessions:
+            return {"result":result,"run":self.run_view(run_id),"rematch":None,"batch_pending_session_ids":[row["id"] for row in pending_sessions]}
+        batch_results = self.store.all("SELECT result_json FROM evaluations e JOIN sessions s ON s.id=e.session_id WHERE s.run_id=?", (run_id,))
+        batch_effective = all(self.store.load(row["result_json"])["effective"] for row in batch_results)
+        result["batch_effective"] = batch_effective
+        if batch_effective:
+            self.transition(run_id,"UPDATED_PROFILE","effective learning gains")
+            self.graph.rebuild(); self.transition(run_id,"FINISHED","profile and graph updated")
+            return {"result":result,"run":self.run_view(run_id),"rematch":None}
+        self.transition(run_id,"MATCHING","ineffective learning causes rematch")
+        return {"result":result,"run":self.run_view(run_id),"rematch":self.run_matching("ineffective session",run_id)}
 
-def complete_session(db: DBSession, session_id: str) -> Session:
-    session = peer_agent.complete_session(db, session_id)
-    transition(db, session.run_id, RunState.EVALUATION, f"{session_id} completed")
-    return session
+    def submit_all_evaluations(self, run_id: str, submissions: list[dict]) -> dict:
+        """Validate and submit every outstanding evaluation in one approved-session batch."""
+        run = self.store.one("SELECT current_state FROM runs WHERE id=?", (run_id,))
+        if not run: raise ValueError("Run not found")
+        if run["current_state"] != "EVALUATION": raise ValueError("Run is not awaiting evaluations")
+        pending_ids = {row["id"] for row in self.store.all("SELECT e.id FROM evaluations e JOIN sessions s ON s.id=e.session_id WHERE s.run_id=? AND e.status='PENDING'", (run_id,))}
+        supplied = {submission["evaluation_id"] for submission in submissions}
+        if len(supplied) != len(submissions): raise ValueError("Each evaluation may be submitted only once")
+        if supplied != pending_ids:
+            missing = sorted(pending_ids-supplied); extra = sorted(supplied-pending_ids)
+            raise ValueError(f"Submit exactly the pending evaluations; missing={missing}, invalid={extra}")
+        results = []
+        for submission in submissions:
+            results.append(self.submit_evaluation(submission["evaluation_id"], submission["post_scores"]))
+        final = results[-1]
+        return {"submitted_evaluation_count":len(results),"evaluation_results":[result["result"] for result in results],"run":final["run"],"rematch":final["rematch"]}
 
-
-def submit_evaluation(db: DBSession, evaluation_id: str, answers: list[dict], budget: Budget | None = None) -> dict:
-    from .persistence.models import Evaluation
-
-    evaluation = db.get(Evaluation, evaluation_id)
-    result = evaluation_agent.submit_evaluation(db, evaluation_id, answers, budget)
-    run_id = evaluation.run_id
-
-    if result["effective"]:
-        updates = evaluation_agent.apply_profile_updates(db, evaluation.session_id)
-        transition(db, run_id, RunState.UPDATED_PROFILE, f"average gain {result['average_gain']}")
-        G.build_graph(db)  # dynamic graph update
-        artifacts.save(run_id, "graph_snapshot_after", G.snapshot(db))
-        artifacts.save(run_id, "learning_gains", result)
-        transition(db, run_id, RunState.FINISHED, "profile and graph updated")
-        result["profile_updates"] = updates
-        result["next_state"] = RunState.FINISHED.value
-    else:
-        transition(db, run_id, RunState.MATCHING, f"ineffective session (gain {result['average_gain']}) - rematching")
-        artifacts.save(run_id, "learning_gains", result)
-        result["profile_updates"] = []
-        result["next_state"] = RunState.MATCHING.value
-    return result
-
-
-def finish_no_match(db: DBSession, run_id: str) -> None:
-    transition(db, run_id, RunState.FINISHED, "no match available")
-
-
-def _match_dict(match: MatchCandidate) -> dict:
-    return {
-        "id": match.id,
-        "run_id": match.run_id,
-        "members": match.members,
-        "relationships": match.relationships,
-        "properties": match.properties,
-        "components": match.components,
-        "score": match.score,
-        "status": match.status,
-        "decided_by": match.decided_by,
-        "reason": match.reason,
-    }
+    def run_view(self,run_id:str)->dict:
+        run=self.store.one("SELECT * FROM runs WHERE id=?",(run_id,));
+        if not run: raise ValueError("Run not found")
+        run["metadata"]=self.store.load(run.pop("metadata_json")); run["transitions"]=self.store.all("SELECT from_state,to_state,reason,created_at FROM transitions WHERE run_id=? ORDER BY id",(run_id,)); return run

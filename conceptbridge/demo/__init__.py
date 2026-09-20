@@ -1,1 +1,1 @@
-"""Domain agents built on top of the reusable `slice/` engine."""
+"""Demo domains packaged with this repository."""

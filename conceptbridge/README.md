@@ -1,183 +1,142 @@
-# ConceptBridge — agentic peer-match pilot
+# ConceptBridge backend
 
-A CLI agent that turns one quiz into **reciprocal** peer-learning pairs,
-asks a human to approve each pairing, runs a peer session, measures the
-learning gain, and **goes back and re-matches** when the session did not
-work.
+A working FastAPI + SQLite backend for human-in-the-loop, adaptive peer learning. It deliberately separates a **candidate pool** from the single candidate a human approves.
 
-Deterministic Python owns every number and every transition. The language
-model only explains a match and writes the session plan.
+## Critical matching guarantee
 
-```
-INPUT → PROFILING → MATCHING → WAITING_FOR_APPROVAL
-                       ↑                │
-                       │ reject/ineffective
-                       │                ▼
-                       │   SESSION → EVALUATION → UPDATED_PROFILE → FINISHED
-                       └────────────────┘
-MATCHING → NO_SUITABLE_MATCH
-```
+`POST /api/v1/matching/run` rebuilds the current transfer graph and enumerates every student combination whose size is in the configured inclusive range `MIN_GROUP_SIZE..MAX_GROUP_SIZE`. For each combination it gathers the internal directed transfer edges and returns it when it has at least one meaningful relationship and does not violate teaching-load limits.
 
----
+Reciprocity and cycles are calculated as explainable ranking features only. Neither is a validity gate. Therefore a source fan-out such as `A -> B`, `A -> C`, `A -> D` is returned as a valid group, as are multiple-teacher, complementary, and mixed groups.
 
-## 1. Install
+For eight students and the default maximum size of five the response reports these considered combinations:
 
-Python 3.10+ is all you need.
+| Size | Combinations |
+| --- | ---: |
+| 2 | 28 |
+| 3 | 56 |
+| 4 | 70 |
+| 5 | 56 |
 
-```bash
-cd conceptbridge
+## Run it
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt    # optional, see below
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+python scripts/seed_demo.py
+uvicorn demo.conceptbridge.api:app --reload
 ```
 
-**`requirements.txt` is optional.** The project ships a Pydantic
-compatibility layer (`slice/compat.py`): if `pydantic` is installed it is
-used, otherwise a strict built-in fallback takes over. The same is true
-of `pytest` — `python tests/run_tests.py` runs the suite with no packages
-at all. There are **no other dependencies**; the OpenRouter client is
-built on the standard library.
+Open [Swagger UI](http://127.0.0.1:8000/docs). The database is at `runtime/conceptbridge.db` by default.
 
-## 2. Environment
+Run the automated demo discovery:
 
-```bash
-cp .env.example .env
+```powershell
+python scripts/run_demo.py
 ```
 
-```env
-OPENROUTER_API_KEY=sk-or-...
-SLICE_MODEL=openai/gpt-4o-mini
-SLICE_FALLBACK_MODEL=meta-llama/llama-3.1-8b-instruct
-SLICE_ESCALATION_MODEL=anthropic/claude-3.5-sonnet
+To remove every record without reseeding demo data, run:
+
+```powershell
+python scripts/reset_empty_database.py
 ```
 
-The key is read only by `slice/config.py`, is never hard-coded and is
-never printed. `.env` is git-ignored.
+The schema remains intact, ready for manual student, concept, question, and answer creation through Swagger. The equivalent SQL is in `scripts/reset_empty_database.sql`.
 
-## 3. Run it
+Run the tests:
 
-```bash
-# offline, no API key, no cost — the demo path
-python scripts/conceptbridge.py run --stub
-
-# the three scenarios
-python scripts/conceptbridge.py run --stub --scenario success
-python scripts/conceptbridge.py run --stub --scenario reject
-python scripts/conceptbridge.py run --stub --scenario ineffective
-python scripts/conceptbridge.py run --stub --scenario no-match
-
-# non-interactive approval (used by tests and CI)
-python scripts/conceptbridge.py run --stub --approval yes
-python scripts/conceptbridge.py run --stub --approval no
-python scripts/conceptbridge.py run --stub --approval no,yes
-
-# live OpenRouter (needs OPENROUTER_API_KEY; ~2 model calls)
-python scripts/conceptbridge.py run
-
-# pause, then continue in a new process
-python scripts/conceptbridge.py run --stub --stop-after MATCHING
-python scripts/conceptbridge.py resume --stub --approval yes
-
-# look at what actually happened, then clear it
-python scripts/conceptbridge.py inspect
-python scripts/conceptbridge.py reset
+```powershell
+python -m pytest -q
 ```
 
-With no `--approval` flag the run is **interactive**: it stops and waits
-for `y`/`n` at `WAITING_FOR_APPROVAL`. It never approves by itself.
+## Adaptive state flow
 
-## 4. Test
-
-```bash
-pytest -q                     # if pytest is installed
-python tests/run_tests.py     # otherwise; no dependencies
+```text
+INPUT -> PROFILING -> MATCHING -> WAITING_FOR_HUMAN_REVIEW
+                                      | approve       | reject
+                                      v               v
+                                   SESSION          MATCHING (new iteration)
+                                      |
+                                  EVALUATION
+                              effective | ineffective
+                                        v       v
+                           UPDATED_PROFILE     MATCHING (new iteration)
+                                   |
+                                FINISHED
 ```
 
-55 tests: profiling, matching, evaluation, the state machine, persistence,
-failure handling and prompt injection.
+Every transition is persisted in `runs` and `transitions`. Rejections are persisted as decisions and history records. A rematch excludes the rejected exact participant combination in the same root cycle when alternatives exist; it never treats that relationship as permanently invalid.
 
-## 5. What to look at during a demo
+## Main endpoints
 
-The terminal is the story; `records.jsonl` is the proof.
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/v1/students` | Create a student |
+| `PUT` | `/api/v1/students/{id}/scores` | Set a deterministic concept score |
+| `POST` | `/api/v1/concepts` | Create a concept |
+| `POST` | `/api/v1/questions` | Create a tagged question |
+| `POST` | `/api/v1/questions/{id}/answers` | Submit and score an answer |
+| `POST` | `/api/v1/profiling/run` | Aggregate quiz answers into profiles |
+| `POST` | `/api/v1/graph/rebuild` | Recalculate active transfer edges |
+| `GET` | `/api/v1/graph` | Inspect edges and graph health |
+| `POST` | `/api/v1/matching/run` | Generate the full valid candidate pool |
+| `GET` | `/api/v1/matching/{candidate_id}` | Inspect deterministic evidence |
+| `POST` | `/api/v1/matching/{candidate_id}/approve` | Human selects any pending candidate |
+| `POST` | `/api/v1/matching/runs/{run_id}/approve-all` | Human batch-approves all pending candidates and creates a session for each |
+| `POST` | `/api/v1/matching/{candidate_id}/reject` | Persist a rejection and rematch |
+| `POST` | `/api/v1/sessions/{session_id}/complete` | Create a targeted follow-up evaluation |
+| `POST` | `/api/v1/matching/runs/{run_id}/sessions/complete-all` | Complete all planned batch sessions and return their evaluations |
+| `POST` | `/api/v1/evaluations/{evaluation_id}/submit` | Server calculates gains and rematches if ineffective |
+| `POST` | `/api/v1/matching/runs/{run_id}/evaluations/submit-all` | Submit every pending evaluation in a batch at once |
+| `GET` | `/api/v1/runs/{run_id}` | Read persisted state history |
+| `GET` | `/api/v1/analytics` | Read graph/runs/history analytics |
 
-```bash
-python scripts/conceptbridge.py run --stub --scenario ineffective
-python scripts/conceptbridge.py inspect
+## Example human loop
+
+```powershell
+# after seeding and starting the API
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/v1/matching/run
+
+# approve/reject an ID returned in candidates; it is never auto-selected
+Invoke-RestMethod -Method Post -ContentType application/json -Body '{"actor":"facilitator","reason":"Need wider coverage"}' http://127.0.0.1:8000/api/v1/matching/CAN-.../reject
 ```
 
-```
-MATCHING              match_candidate    S1|S2 score=0.83
-WAITING_FOR_APPROVAL  approval           S1|S2 approved=True
-EVALUATION            outcome            S1|S2 effective=False
-EVALUATION            state_transition   EVALUATION -> MATCHING     ← the agentic bit
-MATCHING              match_candidate    S1|S3 score=0.73
-EVALUATION            outcome            S1|S3 effective=True
-UPDATED_PROFILE       profile_update     S1 SQL Joins 0.35 -> 0.78
+Batch approval is explicitly human initiated:
+
+```powershell
+Invoke-RestMethod -Method Post -ContentType application/json -Body '{"actor":"facilitator","duration_minutes":45}' http://127.0.0.1:8000/api/v1/matching/runs/RUN-.../approve-all
 ```
 
-## 6. Layout
+It returns one planned session per candidate. Complete and submit each returned session separately; the run remains in `EVALUATION` until its batch is fully evaluated, then it either finishes or rematches.
 
-```
-slice/                    reusable engine — knows nothing about ConceptBridge
-  config.py               environment + .env parsing (the only place)
-  compat.py               pydantic-or-fallback models
-  errors.py               infrastructure error types
-  budget.py               token/attempt budgets (never domain counters)
-  records.py              append-only record model
-  store.py                state.json + records.jsonl
-  llm.py                  OpenRouter gateway, model chain, fallbacks
-  structured.py           JSON extraction, validation, schema repair
-  runner.py               explicit state-machine execution
+## Layout
 
-demo/conceptbridge/       the agent — depends on slice, never the reverse
-  SPEC.md                 the specification this was built from
-  schema.py               typed domain models
-  profiling.py            quiz → concept profiles      (deterministic)
-  matching.py             reciprocal compatibility      (deterministic)
-  evaluation.py           learning gain, profile deltas (deterministic)
-  session.py              match explanation + session plan  (LLM + fallback)
-  flow.py                 state handlers and transitions
-  main.py                 run / resume / inspect / reset
-  stub.py                 offline deterministic provider
-  prompts/                versioned prompts with injection defences
-  data/                   the pilot dataset
-
-scripts/conceptbridge.py  CLI
-tests/                    7 test modules + a no-dependency runner
-runtime/conceptbridge/    state.json, records.jsonl (git-ignored)
+```text
+demo/conceptbridge/
+  agents/          Profiling, peer-learning, and evaluation agents
+  api.py           FastAPI endpoints
+  config.py        All configurable thresholds and score weights
+  db.py            SQLite schema and storage helpers
+  graph.py         Deterministic current transfer graph and metrics
+  matching.py      Exhaustive valid combination enumeration and scoring
+  orchestrator.py  Persisted state machine plus approval/rematch loop
+  seed.py          Eight-student demo data
+scripts/           Seeding and discovery demo
+tests/             Group enumeration, rejection, approval, evaluation tests
 ```
 
-## 7. Adding a frontend or backend later
+## LLM boundary and OpenRouter setup
 
-Nothing here has to be thrown away.
+MCQs, profiling aggregation, graph construction, candidate generation, group scoring, state transitions, and gains are deterministic. The reusable [`llm.py`](demo/conceptbridge/llm.py) gateway validates structured OpenRouter responses and retries with a configured fallback model.
 
-| You want | Touch |
-|---|---|
-| HTTP API | new `api/` package calling `demo.conceptbridge.main.run/resume` |
-| web approval instead of CLI | `flow._read_approval` — swap the input source |
-| real database | `slice/store.py` only; the interface is `append / read_records / save_state / load_state` |
-| different model | `.env` (`SLICE_MODEL`), nothing in the code |
-| more concepts or students | `data/*.csv` — no code change |
-| different thresholds | `matching.STRENGTH_THRESHOLD`, `GAP_THRESHOLD`, `evaluation.LEARNING_GAIN_THRESHOLD` |
-| more re-match attempts | `flow.MAX_REMATCH_ATTEMPTS` |
+To enable LLM features, add this to your uncommitted `.env` file and restart Uvicorn:
 
-## 8. Checklist
+```dotenv
+CONCEPTBRIDGE_DEMO_MODE=false
+OPENROUTER_API_KEY=your_key_here
+CONCEPTBRIDGE_LLM_MODEL=openai/gpt-4.1-mini
+CONCEPTBRIDGE_LLM_FALLBACK_MODEL=openai/gpt-4.1-mini
+```
 
-- [x] `python scripts/conceptbridge.py run --stub` works with no API key
-- [x] concept profiles derived from question-level evidence, not stored
-- [x] reciprocal compatibility is deterministic and documented
-- [x] candidate match is explainable (LLM, with deterministic fallback)
-- [x] CLI accepts human approval and never auto-approves
-- [x] rejection causes a backward transition and excludes the pair
-- [x] approved match generates a peer-learning session
-- [x] follow-up quiz evaluated; gain computed in Python
-- [x] effective outcome updates the profile; ineffective re-matches
-- [x] previously rejected/ineffective pairs are excluded
-- [x] no suitable match terminates cleanly
-- [x] state persists to JSON/JSONL and the run resumes
-- [x] OpenRouter integration via `slice.llm.complete` only
-- [x] invalid model output repaired, then failed safely
-- [x] adversarial student text cannot change scores or rules
-- [x] bounded: token/attempt budget, re-match limit, max-steps guard
-- [x] full test suite passes
-- [x] no frontend, no backend routes
+LLM calls are limited to: grading open-ended profile answers, creating session language (objectives, examples, activities, and checks), and generating follow-up assessment questions. If the key/provider/output is unavailable, the system safely uses its deterministic fallback. MCQs and matchmaking never call an LLM; the LLM cannot change participants, concepts, scores, or state transitions.
