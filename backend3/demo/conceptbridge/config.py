@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     llm_model: str = "openai/gpt-4.1-mini"
     llm_fallback_model: str = "openai/gpt-4.1-mini"
     llm_timeout: float = 20.0
-    llm_max_tokens: int = 1200
+    llm_max_tokens: int = 3000
     weight_coverage: float = 0.30
     weight_reciprocity: float = 0.10
     weight_transfer_strength: float = 0.30

@@ -54,7 +54,10 @@ class OpenRouterClient:
                     timeout=self.settings.llm_timeout,
                 )
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
+                choice = response.json()["choices"][0]
+                content = choice["message"]["content"]
+                if choice.get("finish_reason") == "length":
+                    raise ValueError("provider truncated the structured response at max_tokens")
                 return output_model.model_validate(json.loads(content))
             except Exception as exc:
                 errors.append(f"{model}: {exc}")

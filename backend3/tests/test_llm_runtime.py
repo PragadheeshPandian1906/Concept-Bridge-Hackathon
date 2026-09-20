@@ -18,6 +18,14 @@ class FakeResponse:
         return {"choices": [{"message": {"content": '{"answer":"connected"}'}}]}
 
 
+class TruncatedResponse:
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"choices": [{"finish_reason": "length", "message": {"content": '{"answer":"incomplete'}}]}
+
+
 def test_configured_runtime_calls_openrouter(monkeypatch, tmp_path):
     calls = []
 
@@ -47,6 +55,14 @@ def test_demo_mode_blocks_provider_call(monkeypatch, tmp_path):
     settings = Settings(database_path=str(tmp_path / "test.db"), demo_mode=True, openrouter_api_key="test-key")
 
     with pytest.raises(LLMUnavailable, match="disabled"):
+        OpenRouterClient(settings).structured("system", "user", DemoOutput)
+
+
+def test_truncated_provider_response_is_reported(monkeypatch, tmp_path):
+    monkeypatch.setattr("slice.llm.httpx.post", lambda *args, **kwargs: TruncatedResponse())
+    settings = Settings(database_path=str(tmp_path / "test.db"), demo_mode=False, openrouter_api_key="test-key")
+
+    with pytest.raises(LLMUnavailable, match="truncated"):
         OpenRouterClient(settings).structured("system", "user", DemoOutput)
 
 
